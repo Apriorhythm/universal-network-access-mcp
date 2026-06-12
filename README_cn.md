@@ -117,6 +117,15 @@
 > "使用 `httpx` 库获取 [https://api.github.com](https://api.github.com) 并打印 rate limit 头信息。"
 > *(如果缺少库，Claude 会自动通过 pip 安装)*
 
+## 长任务与超时说明
+
+- `run_python` / `run_shell` 的 `timeout` 参数只控制**服务端子进程**的最长运行时间,
+  不会延长 Claude 客户端的等待。执行期间服务器会每隔约 2 秒发送进度通知,
+  以避免客户端在十几秒内判定超时。
+- 对预计耗时很久的任务(大查询、大同步、首次安装大量依赖),传 `background: true`:
+  调用会立即返回一个 `job_id`,随后用 `check_job` 工具轮询状态与结果,从根本上避免超时。
+- 在 Claude 中止某次调用时,本机对应的子进程会被真正终止,不会留下孤儿进程。
+
 ## 常见问题排查
 
 **`python: command not found` 或 Windows 打开商店而不是 Python**

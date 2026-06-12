@@ -119,6 +119,18 @@ Once installed, just describe what you want in plain language. Claude will use `
 > "Use the `httpx` library to fetch https://api.github.com and print the rate limit headers."
 > *(Claude will pip install httpx automatically if not present)*
 
+## Long-running tasks & timeouts
+
+- The `timeout` argument on `run_python` / `run_shell` only caps the **server-side
+  subprocess** runtime; it does NOT extend the Claude client's wait. While a call runs,
+  the server emits a progress notification every ~2 seconds to keep the client from
+  timing out within a dozen seconds.
+- For tasks expected to take a long time (big queries, large syncs, first-time install of
+  many dependencies), pass `background: true`: the call returns a `job_id` immediately, then
+  poll status and result with the `check_job` tool. This avoids client timeouts entirely.
+- When you abort a call in Claude, the corresponding local subprocess is actually
+  terminated — no orphan processes left behind.
+
 ## Troubleshooting
 
 **`python: command not found` or Windows Store opens instead of Python**
