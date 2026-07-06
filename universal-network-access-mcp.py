@@ -19,6 +19,8 @@ import subprocess
 import time
 import tempfile
 import threading
+import atexit
+import signal
 
 
 # ============================================================
@@ -107,6 +109,22 @@ def content(text, is_error=False):
     return r
 
 
+def _clip(s, n=500):
+    """截断异常串并剔除控制字符（保留 \\t \\n），避免回显噪声/敏感信息过长。"""
+    s = str(s)
+    s = "".join(ch for ch in s if ch >= " " or ch in "\t\n")
+    return s[:n]
+
+
+def _safe_timeout(v, default=30):
+    """安全解析 timeout：无法转 int 或 ≤0 → default；超大按原样接受（调用方责任）。绝不抛。"""
+    try:
+        t = int(v)
+    except (TypeError, ValueError):
+        return default
+    return t if t > 0 else default
+
+
 def send_progress(token, progress, total, message, out=None):
     if token is None:
         return
@@ -128,6 +146,12 @@ def send_progress(token, progress, total, message, out=None):
 _jobs = {}
 _jobs_lock = threading.Lock()
 _job_counter = 0
+_finish_counter = 0                # 进入终态的单调序号，用于淘汰最旧终态 job
+MAX_TERMINAL_JOBS = 100            # _jobs 中终态 job 的容量上界
+
+
+def is_terminal(status):
+    return status in ("done", "error", "timeout", "cancelled")
 
 
 class Job:
@@ -139,6 +163,7 @@ class Job:
         self.cancel_event = threading.Event()
         self.start = time.monotonic()
         self.message = "正在启动…"
+        self.finish_seq = None    # 进入终态时由 finish_job 分配
 
 
 def new_job(request_id):
@@ -161,6 +186,24 @@ def find_running_by_request(request_id):
             if j.request_id == request_id and j.status == "running":
                 return j
     return None
+
+
+def finish_job(job, status, text):
+    """在 _jobs_lock 内原子完成：置终态 + 分配完成序号 + 容量淘汰最旧终态 job。
+    所有终态转换必须经此函数（不变量 INV-1）；running job 绝不被淘汰。"""
+    global _finish_counter
+    with _jobs_lock:
+        job.status = status
+        job.result_text = text
+        _finish_counter += 1
+        job.finish_seq = _finish_counter
+        # 只统计经 finish_job 赋过序号的终态 job（手工设 status 的测试 job finish_seq=None，不参与，防 None 排序）
+        terminal = [j for j in _jobs.values()
+                    if is_terminal(j.status) and j.finish_seq is not None]
+        if len(terminal) > MAX_TERMINAL_JOBS:
+            terminal.sort(key=lambda j: j.finish_seq)
+            for old in terminal[:len(terminal) - MAX_TERMINAL_JOBS]:
+                _jobs.pop(old.id, None)
 
 
 # ============================================================
@@ -199,10 +242,12 @@ def run_subprocess(cmd, timeout, shell=False, on_tick=None,
     超时抛 subprocess.TimeoutExpired,取消抛 Cancelled。
     stdout/stderr 写入临时文件,避免 PIPE 缓冲写满导致死锁。
     """
+    proc = None                       # 前置绑定，防 Popen 抛异常时 finally 引用 proc NameError
     out_f = tempfile.TemporaryFile()
     err_f = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, shell=shell)
+        _register_proc(proc)
         start = time.monotonic()
         last_tick = 0.0
         while proc.poll() is None:
@@ -222,6 +267,8 @@ def run_subprocess(cmd, timeout, shell=False, on_tick=None,
         raw_out = out_f.read()
         raw_err = err_f.read()
     finally:
+        if proc is not None:
+            _unregister_proc(proc)
         out_f.close()
         err_f.close()
     return (
@@ -232,6 +279,43 @@ def run_subprocess(cmd, timeout, shell=False, on_tick=None,
 
 
 _pip_lock = threading.Lock()
+
+
+# ============================================================
+# 活跃子进程注册表：退出时尽力终止运行中的子进程（独立锁）
+# ============================================================
+_procs = set()
+_procs_lock = threading.Lock()
+
+
+def _register_proc(p):
+    with _procs_lock:
+        _procs.add(p)
+    try:
+        sys.stderr.write("[proc] pid=%s\n" % p.pid)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _unregister_proc(p):
+    with _procs_lock:
+        _procs.discard(p)   # 幂等
+
+
+def _shutdown_procs():
+    """遍历注册表逐个 terminate（超时则 kill）。锁内取快照、锁外终止；对任何 Popen 的异常一律吞。"""
+    with _procs_lock:
+        snapshot = list(_procs)
+    for p in snapshot:
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        except Exception:
+            pass
 
 
 def make_on_tick(progress_token, total, job):
@@ -249,7 +333,7 @@ def make_on_tick(progress_token, total, job):
 
 def tool_run_python(args, on_tick, job):
     code = args.get("code", "")
-    timeout = int(args.get("timeout", 30))
+    timeout = _safe_timeout(args.get("timeout", 30))
     if not code:
         return "请提供 code 参数"
 
@@ -292,7 +376,7 @@ def tool_run_python(args, on_tick, job):
 def tool_run_shell(args, on_tick, job):
     command = args.get("command", "")
     shell_type = args.get("shell", "cmd")
-    timeout = int(args.get("timeout", 30))
+    timeout = _safe_timeout(args.get("timeout", 30))
     if not command:
         return "请提供 command 参数"
 
@@ -322,13 +406,17 @@ def tool_run_shell(args, on_tick, job):
 
 def tool_check_job(args):
     job_id = args.get("job_id", "")
-    job = get_job(job_id)
-    if not job:
-        return "未找到 job:%s" % job_id
-    if job.status == "running":
-        elapsed = int(time.monotonic() - job.start)
-        return "运行中… 已耗时 %ds,当前:%s" % (elapsed, job.message)
-    return "[%s]\n%s" % (job.status, job.result_text)
+    job = get_job(job_id)             # 非消费性：读取不删除
+    if job:
+        if job.status == "running":
+            elapsed = int(time.monotonic() - job.start)
+            return "运行中… 已耗时 %ds,当前:%s" % (elapsed, job.message)
+        return "[%s]\n%s" % (job.status, job.result_text)
+    # 未命中：区分"曾存在但被挤出" vs "从未存在"
+    m = re.fullmatch(r"job-(\d+)", job_id or "")   # 解析失败即视为未找到
+    if m and int(m.group(1)) <= _job_counter:
+        return "结果已被更新的任务挤出（勿重跑，以最后一次结果为准）:%s" % job_id
+    return "未找到 job:%s" % job_id
 
 
 # ============================================================
@@ -398,36 +486,46 @@ TOOLS = [
 # Worker:在独立线程里执行 run_python / run_shell
 # ============================================================
 def worker(job, name, arguments, request_id, progress_token, background):
-    total = int(arguments.get("timeout", 30))
+    # responded 单标志：ack 与终态响应共用；每次 send 后即置位，finally 只兜底"漏发"。
+    responded = False
+    total = _safe_timeout(arguments.get("timeout", 30))   # 非法→30，绝不抛
     on_tick = make_on_tick(progress_token, total, job)
 
     if background:
         send(ok(request_id, content(
             "已在后台启动,job_id=%s。请用 check_job 轮询结果。" % job.id)))
+        responded = True   # ack 即 background 的唯一响应
 
     try:
         if name == "run_python":
             text = tool_run_python(arguments, on_tick, job)
         else:  # run_shell
             text = tool_run_shell(arguments, on_tick, job)
-        job.status = "done"
-        job.result_text = text
-        is_error = False
+        finish_job(job, "done", text)
+        if not background and not responded:
+            send(ok(request_id, content(text)))
+            responded = True
     except subprocess.TimeoutExpired:
-        job.status = "timeout"
-        job.result_text = "执行超时(%ds)" % total
-        is_error = True
+        finish_job(job, "timeout", "执行超时(%ds)" % total)
+        if not background and not responded:
+            send(ok(request_id, content(job.result_text, is_error=True)))
+            responded = True
     except Cancelled:
-        job.status = "cancelled"
-        job.result_text = "已取消"
-        is_error = True
+        finish_job(job, "cancelled", "已取消")
+        if not background and not responded:
+            send(ok(request_id, content(job.result_text, is_error=True)))
+            responded = True
     except Exception as e:  # 兜底,绝不让线程崩溃
-        job.status = "error"
-        job.result_text = "执行失败:%s" % e
-        is_error = True
-
-    if not background:
-        send(ok(request_id, content(job.result_text, is_error=is_error)))
+        finish_job(job, "error", "执行失败:%s" % _clip(str(e)))
+        if not background and not responded:
+            send(ok(request_id, content(job.result_text, is_error=True)))
+            responded = True
+    finally:
+        # 未预期路径（如 except Exception 抓不到的情形）：保证必达终态 + 非 bg 不漏响应
+        if job.status == "running":
+            finish_job(job, "error", "worker 异常退出")
+        if not background and not responded:
+            send(ok(request_id, content(job.result_text, is_error=True)))
 
 
 # ============================================================
@@ -435,6 +533,9 @@ def worker(job, name, arguments, request_id, progress_token, background):
 # 调度:reader 线程只解析/路由,绝不阻塞在执行上
 # ============================================================
 def dispatch(req):
+    if not isinstance(req, dict):
+        send(err(None, -32600, "请求必须是 JSON 对象"))
+        return
     method = req.get("method")
     rid = req.get("id")
     params = req.get("params", {})
@@ -463,7 +564,12 @@ def dispatch(req):
                 args=(job, name, arguments, rid, progress_token, background),
                 daemon=True,
             )
-            t.start()
+            try:
+                t.start()
+            except Exception as e:
+                # 线程启动失败：先置终态杜绝 running 残留，再回 -32603
+                finish_job(job, "error", "线程启动失败: %s" % _clip(str(e)))
+                send(err(rid, -32603, _clip("线程启动失败: %s" % e)))
         else:
             send(err(rid, -32601, "未知工具: %s" % name))
     elif method == "notifications/cancelled":
@@ -477,15 +583,43 @@ def dispatch(req):
             send(err(rid, -32601, "不支持: %s" % method))
 
 
-def main():
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+def _sig_handler(signum, frame):
+    _shutdown_procs()
+    os._exit(0)   # 固定 os._exit：跳过 finally/atexit，避免清理逻辑三重再入
+
+
+def _install_signal_handlers():
+    # signal 只能在主线程注册；SIGTERM 在 Windows 支持有限 → 仅 POSIX + 主线程安装
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
         try:
-            dispatch(json.loads(line))
-        except json.JSONDecodeError as e:
-            send(err(None, -32700, str(e)))
+            signal.signal(signal.SIGTERM, _sig_handler)
+            signal.signal(signal.SIGINT, _sig_handler)
+        except Exception:
+            pass
+
+
+def main():
+    _install_signal_handlers()
+    atexit.register(_shutdown_procs)   # 兜底：正常返回 / 未捕获异常
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError as e:
+                send(err(None, -32700, _clip(str(e))))
+                continue
+            try:
+                dispatch(req)
+            except Exception as e:
+                # dispatch 内部任意异常都不得终止主循环
+                rid = req.get("id") if isinstance(req, dict) else None
+                if rid is not None:
+                    send(err(rid, -32603, _clip(str(e))))
+    finally:
+        _shutdown_procs()   # stdin EOF / 主循环异常退出时清理运行中子进程
 
 
 if __name__ == "__main__":

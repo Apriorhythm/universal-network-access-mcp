@@ -129,7 +129,9 @@ Once installed, just describe what you want in plain language. Claude will use `
   many dependencies), pass `background: true`: the call returns a `job_id` immediately, then
   poll status and result with the `check_job` tool. This avoids client timeouts entirely.
 - When you abort a call in Claude, the corresponding local subprocess is actually
-  terminated — no orphan processes left behind.
+  terminated. The server also cleans up running subprocesses when it shuts down normally
+  or on catchable signals (stdin EOF / SIGTERM / SIGINT); a hard kill (SIGKILL) cannot be
+  intercepted, so that path is out of scope.
 
 ## Troubleshooting
 
